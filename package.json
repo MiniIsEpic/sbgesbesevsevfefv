@@ -26,6 +26,6 @@
     "tsx": "^4.19.0"
   },
   "overrides": {
-    "uuid": "9.0.1"
+    "rpc-websockets": "9.3.8"
   }
 }
