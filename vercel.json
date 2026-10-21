@@ -1,4 +1,5 @@
 {
+  "installCommand": "rm -f package-lock.json && npm install",
   "functions": {
     "api/*.ts": { "maxDuration": 60 }
   }
