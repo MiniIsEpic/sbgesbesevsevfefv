@@ -59,8 +59,8 @@ export type Pending =
   | { kind: 'import-multi' }
   | { kind: 'withdraw-pin' }
   | { kind: 'autosend-pin' }
-  | { kind: 'wd-amount'; label: string; index: number; net: string }
-  | { kind: 'wd-address'; label: string; index: number; net: string; amount: string }
+  | { kind: 'wd-amount'; label: string; index: number; net: string; asset: string }
+  | { kind: 'wd-address'; label: string; index: number; net: string; amount: string; asset: string }
   | { kind: 'as-min'; label: string; index: number; net: string }
   | { kind: 'as-address'; label: string; index: number; net: string; minUsd: number }
   | { kind: 'th-custom' }
@@ -77,6 +77,8 @@ export interface PendingWithdraw {
   amount: string;
   to: string;
   createdAt: number;
+  /** 'native' or an ERC-20 contract / SPL mint address. */
+  asset: string;
 }
 
 export interface PendingAutosend {
