@@ -1,6 +1,7 @@
 import { Bot, InlineKeyboard, type Context } from 'grammy';
 import { JsonRpcProvider } from 'ethers';
 import { addressFor, getBalance, isValidAddress, sendNative } from './chains/index.js';
+import { sendToken, stableBySymbol, tokenBalance } from './chains/token.js';
 import { baselineWallet, buildPool, discoverAccounts } from './accounts.js';
 import { allowedUsers, botToken, withdrawLimitUsd } from './config.js';
 import { decryptSeed, encryptAuto, encryptSeed, hashPin, verifyPin } from './crypto.js';
@@ -71,8 +72,8 @@ async function resolveAccount(id: number, token: string): Promise<{ w: store.Wal
 
 const CONFIRM_HTML = { parse_mode: 'HTML' as const, link_preview_options: { is_disabled: true } };
 
-/** Validates a withdrawal and shows the Confirm/Cancel buttons. Shared by the /withdraw command and the button flow. */
-async function presentWithdraw(ctx: Context, acctRaw: string, netKey: string, amtRaw: string, to: string): Promise<void> {
+/** Validates a withdrawal (native coin or a USDC/USDT token) and shows the Confirm/Cancel buttons. */
+async function presentWithdraw(ctx: Context, acctRaw: string, netKey: string, amtRaw: string, to: string, asset = 'native'): Promise<void> {
   const id = ctx.from!.id;
   const res = await resolveAccount(id, acctRaw);
   if (!res) return void (await ctx.reply(`No account "${acctRaw}".`));
@@ -85,24 +86,41 @@ async function presentWithdraw(ctx: Context, acctRaw: string, netKey: string, am
   const from = addressFor(net, acct.addresses);
   if (to.toLowerCase() === from.toLowerCase()) return void (await ctx.reply('Destination is the same account.'));
 
+  // Asset: native coin, or a stablecoin ($1). `asset` is 'native' or a contract/mint address.
+  const isToken = asset !== 'native';
+  const stable = isToken ? net.stables?.[asset.toLowerCase()] ?? net.stables?.[asset] : undefined;
+  if (isToken && !stable) return void (await ctx.reply('That token is not supported on this network.'));
+  const decimals = isToken ? stable!.decimals : net.decimals;
+  const symbol = isToken ? stable!.symbol : net.symbol;
+
   let bal: bigint;
-  try { bal = await getBalance(net, acct.addresses); } catch (e) { return void (await ctx.reply(`Could not fetch balance: ${(e as Error).message.slice(0, 120)}`)); }
+  try {
+    bal = isToken ? await tokenBalance(net, from, asset) : await getBalance(net, acct.addresses);
+  } catch (e) {
+    return void (await ctx.reply(`Could not fetch balance: ${(e as Error).message.slice(0, 120)}`));
+  }
   let amount: bigint | 'max';
-  try { amount = amtRaw.toLowerCase() === 'max' ? 'max' : parseAmount(amtRaw, net.decimals); } catch (e) { return void (await ctx.reply((e as Error).message)); }
-  if (amount !== 'max' && (amount <= 0n || amount > bal)) return void (await ctx.reply(`Insufficient balance: ${fmtAmount(bal, net.decimals)} ${net.symbol} available.`));
-  if (amount === 'max' && bal === 0n) return void (await ctx.reply('Balance is zero.'));
+  try { amount = amtRaw.toLowerCase() === 'max' ? 'max' : parseAmount(amtRaw, decimals); } catch (e) { return void (await ctx.reply((e as Error).message)); }
+  if (amount !== 'max' && (amount <= 0n || amount > bal)) return void (await ctx.reply(`Insufficient balance: ${fmtAmount(bal, decimals)} ${symbol} available.`));
+  if (amount === 'max' && bal === 0n) return void (await ctx.reply(`No ${symbol} to withdraw.`));
 
   const shown = amount === 'max' ? bal : amount;
-  const price = (await getPrices([net.coingeckoId]))[net.coingeckoId];
-  const usd = price !== undefined ? toFloat(shown, net.decimals) * price : undefined;
+  const price = isToken ? 1 : (await getPrices([net.coingeckoId]))[net.coingeckoId];
+  const usd = price !== undefined ? toFloat(shown, decimals) * price : undefined;
   const limit = withdrawLimitUsd();
   if (limit !== undefined) {
     if (usd === undefined) return void (await ctx.reply('Price unavailable, so the limit cannot be checked. Try again shortly.'));
     if (usd > limit) return void (await ctx.reply(`Above your per-withdrawal limit of ${fmtUsd(limit)}.`));
   }
+  if (isToken) {
+    // Token transfers cost gas in the native coin — warn if the account has none.
+    const nativeBal = await getBalance(net, acct.addresses).catch(() => 1n);
+    if (nativeBal === 0n) return void (await ctx.reply(`This account has no ${net.symbol} to pay the network fee for a ${symbol} transfer. Send a little ${net.symbol} first.`));
+  }
 
-  await store.setWithdraw(id, { label: w.label, index: acct.index, net: net.key, amount: amount === 'max' ? 'max' : amount.toString(), to, createdAt: Date.now() });
-  const amtText = amount === 'max' ? `ALL (≈${fmtAmount(bal, net.decimals)} ${net.symbol} minus fees)` : `${fmtAmount(amount, net.decimals)} ${net.symbol}`;
+  await store.setWithdraw(id, { label: w.label, index: acct.index, net: net.key, asset, amount: amount === 'max' ? 'max' : amount.toString(), to, createdAt: Date.now() });
+  const feeNote = isToken ? '' : amount === 'max' ? ' minus fees' : '';
+  const amtText = amount === 'max' ? `ALL (≈${fmtAmount(bal, decimals)} ${symbol}${feeNote})` : `${fmtAmount(amount, decimals)} ${symbol}`;
   await ctx.reply(
     [
       '<b>Confirm withdrawal</b>',
@@ -327,9 +345,33 @@ export function createBot() {
   // ---- withdraw (button flow) ----
   bot.callbackQuery(/^wd:a:(.+)$/, async (ctx) => { await ctx.answerCallbackQuery(); await editView(ctx, await menu.pickNetworkView(uid(ctx), 'wd', ctx.match[1])); });
   bot.callbackQuery(/^wd:n:(.+):([a-z0-9_-]+)$/, async (ctx) => {
-    const [, ref, net] = ctx.match;
+    const [, ref, netKey] = ctx.match;
+    const net = await getNetwork(netKey);
+    const syms = net?.stables ? [...new Set(Object.values(net.stables).map((s) => s.symbol))] : [];
+    if (net && syms.length) {
+      // Let the user pick which asset to withdraw (native coin or a stablecoin).
+      await ctx.answerCallbackQuery();
+      const kb = new InlineKeyboard().text(net.symbol, `wd:k:${ref}:${netKey}:native`);
+      for (const sym of syms) kb.text(sym, `wd:k:${ref}:${netKey}:${sym}`);
+      kb.row().text('‹ Back', 'nav:wd');
+      return editView(ctx, { text: `What do you want to withdraw from <b>${esc(ref)}</b> on <b>${esc(net.name)}</b>?`, keyboard: kb });
+    }
     const [label, idx] = ref.split('.');
-    await ask(ctx, { kind: 'wd-amount', label, index: Number(idx), net }, `Send the amount of <b>${esc(net.toUpperCase())}</b> to withdraw from <b>${esc(ref)}</b>, or type <code>max</code>.`);
+    await ask(ctx, { kind: 'wd-amount', label, index: Number(idx), net: netKey, asset: 'native' }, `Send the amount of <b>${esc(netKey.toUpperCase())}</b> to withdraw from <b>${esc(ref)}</b>, or type <code>max</code>.`);
+  });
+  bot.callbackQuery(/^wd:k:(.+):([a-z0-9_-]+):([A-Za-z0-9]+)$/, async (ctx) => {
+    const [, ref, netKey, code] = ctx.match;
+    const [label, idx] = ref.split('.');
+    let asset = 'native';
+    let symbol = netKey.toUpperCase();
+    if (code !== 'native') {
+      const net = await getNetwork(netKey);
+      const found = net ? stableBySymbol(net, code) : null;
+      if (!found) return void (await ctx.answerCallbackQuery({ text: 'Unavailable', show_alert: true }));
+      asset = found.token;
+      symbol = code.toUpperCase();
+    }
+    await ask(ctx, { kind: 'wd-amount', label, index: Number(idx), net: netKey, asset }, `Send the amount of <b>${esc(symbol)}</b> to withdraw from <b>${esc(ref)}</b>, or type <code>max</code>.`);
   });
 
   // ---- auto-send (button flow) ----
@@ -628,8 +670,15 @@ export function createBot() {
   bot.command('withdraw', async (ctx) => {
     const id = uid(ctx);
     const parts = args(ctx);
-    if (parts.length !== 4) return ctx.reply('Usage: /withdraw <acct> <net> <amount|max> <address>\nExample: /withdraw main sol 0.5 9xQe…  (or use /menu → Withdraw)');
-    await presentWithdraw(ctx, parts[0], parts[1], parts[2], parts[3]);
+    if (parts.length < 4 || parts.length > 5) return ctx.reply('Usage: /withdraw <acct> <net> <amount|max> <address> [USDC|USDT]\nExample: /withdraw main eth 25 0x… USDC  (or use /menu → Withdraw)');
+    let asset = 'native';
+    if (parts[4]) {
+      const net = await getNetwork(parts[1]);
+      const found = net ? stableBySymbol(net, parts[4]) : null;
+      if (!found) return ctx.reply(`"${parts[4]}" isn't a supported token on ${parts[1]}.`);
+      asset = found.token;
+    }
+    await presentWithdraw(ctx, parts[0], parts[1], parts[2], parts[3], asset);
   });
 
   bot.callbackQuery(/^wd:(ok|no)$/, async (ctx) => {
@@ -709,12 +758,12 @@ export function createBot() {
       }
 
       case 'wd-amount': {
-        await store.setPending(id, { kind: 'wd-address', label: pending.label, index: pending.index, net: pending.net, amount: tokens[0] ?? '' }, 300);
+        await store.setPending(id, { kind: 'wd-address', label: pending.label, index: pending.index, net: pending.net, amount: tokens[0] ?? '', asset: pending.asset }, 300);
         return ctx.reply('Now send the <b>destination address</b>.', HTML);
       }
       case 'wd-address': {
         await store.clearPending(id);
-        await presentWithdraw(ctx, store.ref(pending.label, pending.index), pending.net, pending.amount, tokens[0] ?? '');
+        await presentWithdraw(ctx, store.ref(pending.label, pending.index), pending.net, pending.amount, tokens[0] ?? '', pending.asset);
         return;
       }
 
@@ -961,7 +1010,16 @@ export function createBot() {
         await ctx.reply('Signing and broadcasting…');
         try {
           const phrase = decryptSeed(w.enc, tokens[0]);
-          const { txid } = await sendNative(net, phrase, acct.index, wd.to, wd.amount === 'max' ? 'max' : BigInt(wd.amount));
+          const asset = wd.asset ?? 'native';
+          let txid: string;
+          if (asset === 'native') {
+            ({ txid } = await sendNative(net, phrase, acct.index, wd.to, wd.amount === 'max' ? 'max' : BigInt(wd.amount)));
+          } else {
+            const meta = net.stables?.[asset] ?? net.stables?.[asset.toLowerCase()];
+            if (!meta) return ctx.reply('That token is no longer configured on this network.');
+            const amount = wd.amount === 'max' ? await tokenBalance(net, addressFor(net, acct.addresses), asset) : BigInt(wd.amount);
+            ({ txid } = await sendToken(net, phrase, acct.index, asset, meta.decimals, amount, wd.to));
+          }
           return ctx.reply(`✅ Sent.\nTx: <code>${esc(txid)}</code>\n<a href="${net.explorerTx}${txid}">View on explorer</a>`, HTML);
         } catch (e) {
           return ctx.reply(`❌ Withdrawal failed: ${esc((e as Error).message.slice(0, 300))}`, HTML);
