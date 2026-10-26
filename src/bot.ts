@@ -72,6 +72,29 @@ async function resolveAccount(id: number, token: string): Promise<{ w: store.Wal
 
 const CONFIRM_HTML = { parse_mode: 'HTML' as const, link_preview_options: { is_disabled: true } };
 
+/**
+ * If the user has set auto-send defaults, apply them to a freshly imported wallet so every seed
+ * (including ones imported later) auto-forwards without re-running "Enable on ALL". Returns rule count.
+ */
+async function inheritDefaults(wallet: store.Wallet, phrase: string, settings: store.Settings, nets: Network[]): Promise<number> {
+  if (!settings.defMinUsd || !(settings.defSol || settings.defEvm || settings.defBtc)) return 0;
+  wallet.withdraw = true;
+  wallet.autoEnc = encryptAuto(phrase);
+  let rules = 0;
+  for (const a of wallet.accounts) {
+    a.forward = { ...(a.forward ?? {}) };
+    for (const key of wallet.networks) {
+      const net = nets.find((n) => n.key === key);
+      if (!net) continue;
+      const dest = net.kind === 'sol' ? settings.defSol : net.kind === 'evm' ? settings.defEvm : settings.defBtc;
+      if (!dest || dest.toLowerCase() === addressFor(net, a.addresses).toLowerCase()) continue;
+      a.forward[key] = { to: dest, minUsd: settings.defMinUsd };
+      rules++;
+    }
+  }
+  return rules;
+}
+
 /** Validates a withdrawal (native coin or a USDC/USDT token) and shows the Confirm/Cancel buttons. */
 async function presentWithdraw(ctx: Context, acctRaw: string, netKey: string, amtRaw: string, to: string, asset = 'native'): Promise<void> {
   const id = ctx.from!.id;
@@ -901,6 +924,7 @@ export function createBot() {
           withdraw: false,
           createdAt: Date.now(),
         };
+        const inherited = await inheritDefaults(wallet, phrase, await store.getSettings(id), await getAllNetworks());
         await store.saveWallet(id, wallet);
         await baselineWallet(id, wallet);
         const list = wallet.accounts.map((a) => `• <b>${esc(store.ref(wallet.label, a.index))}</b>  SOL <code>${esc(short(a.addresses.sol))}</code>  EVM <code>${esc(short(a.addresses.evm))}</code>`);
@@ -910,7 +934,9 @@ export function createBot() {
             ...list,
             '',
             'Check these match your wallet app. Tracking is live now.',
-            'Withdrawals are <b>off</b> by default — enable them in 🛡️ Security.',
+            inherited > 0
+              ? `↪️ Auto-send defaults applied (${inherited} rule(s)) — this seed forwards automatically.`
+              : 'Withdrawals are <b>off</b> by default — enable them in 🛡️ Security.',
           ].join('\n'),
           HTML,
         );
@@ -928,9 +954,12 @@ export function createBot() {
         const discover = phrases.length <= 3; // skip per-account discovery for big batches to stay within the function time limit
 
         const wallets = await store.listWallets(id);
+        const settings = await store.getSettings(id);
+        const allNets = await getAllNetworks();
         const seenEvm = new Set(wallets.map((w) => w.pool[0]?.evm));
         const taken = new Set(wallets.map((w) => w.label));
         let counter = 1;
+        let inheritedTotal = 0;
         const nextLabel = () => {
           let l: string;
           do l = `seed${counter++}`;
@@ -959,6 +988,7 @@ export function createBot() {
             withdraw: false,
             createdAt: Date.now() + i,
           };
+          inheritedTotal += await inheritDefaults(wallet, phrase, settings, allNets);
           await store.saveWallet(id, wallet);
           await baselineWallet(id, wallet);
           added.push(`<b>${esc(wallet.label)}</b> (${wallet.accounts.length} acct${wallet.accounts.length > 1 ? 's' : ''})`);
@@ -968,7 +998,9 @@ export function createBot() {
         if (dup.length) out.push(`Skipped already-imported line(s): ${dup.join(', ')}`);
         if (bad.length) out.push(`Invalid seed on line(s): ${bad.join(', ')}`);
         if (over > 0) out.push(`Only the first 10 were processed — send the remaining ${over} in another batch.`);
-        out.push('', 'Seeds are auto-named. Withdrawals are <b>off</b> by default (🛡️ Security).');
+        out.push('', inheritedTotal > 0
+          ? `↪️ Auto-send defaults applied — ${inheritedTotal} rule(s) across the new seed(s).`
+          : 'Seeds are auto-named. Withdrawals are <b>off</b> by default (🛡️ Security).');
         await ctx.reply(out.join('\n'), HTML);
         return showView(ctx, await menu.homeView(id));
       }
