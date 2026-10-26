@@ -1,4 +1,5 @@
 import { Connection, PublicKey, SystemProgram, Transaction, type ParsedTransactionWithMeta } from '@solana/web3.js';
+import { getAssociatedTokenAddressSync } from '@solana/spl-token';
 import { solKeypair } from '../derive.js';
 import type { Network } from '../networks.js';
 import { mapLimit } from '../util.js';
@@ -22,35 +23,78 @@ export function solValidAddress(a: string): boolean {
   }
 }
 
+/**
+ * Watches the owner wallet AND its USDC/USDT token accounts (ATAs). Incoming SPL transfers only
+ * touch the recipient's token account, not the owner wallet, so querying the wallet alone misses them.
+ * The cursor is a JSON map { "<source>": "<last signature>" } — one per watched address.
+ */
 export async function solActivity(net: Network, address: string, cursor: string | null): Promise<Activity> {
   const c = solConn(net);
   const owner = new PublicKey(address);
 
+  const sources: { key: string; pk: PublicKey }[] = [{ key: 'owner', pk: owner }];
+  for (const mint of Object.keys(net.stables ?? {})) {
+    try {
+      sources.push({ key: mint, pk: getAssociatedTokenAddressSync(new PublicKey(mint), owner) });
+    } catch {
+      /* skip a mint that can't derive an ATA */
+    }
+  }
+
+  // Baseline: record the latest signature for every watched address, emit nothing.
   if (cursor === null) {
-    const [latest] = await c.getSignaturesForAddress(owner, { limit: 1 });
-    return { events: [], cursor: latest?.signature ?? 'none', baseline: true };
+    const next: Record<string, string> = {};
+    await Promise.all(
+      sources.map(async (s) => {
+        const [latest] = await c.getSignaturesForAddress(s.pk, { limit: 1 }).catch(() => []);
+        next[s.key] = latest?.signature ?? 'none';
+      }),
+    );
+    return { events: [], cursor: JSON.stringify(next), baseline: true };
   }
 
-  const sigs = await c.getSignaturesForAddress(owner, cursor === 'none' ? { limit: 25 } : { until: cursor, limit: 25 });
-  if (!sigs.length) return { events: [], cursor };
+  // Parse the stored cursor. Legacy cursors were a bare owner signature string.
+  let cmap: Record<string, string> = {};
+  try {
+    const p = JSON.parse(cursor);
+    cmap = p && typeof p === 'object' ? (p as Record<string, string>) : { owner: cursor };
+  } catch {
+    cmap = { owner: cursor };
+  }
 
-  const ordered = [...sigs].reverse(); // oldest first
-  const txs = await mapLimit(ordered, 5, (s) =>
-    s.err ? Promise.resolve(null) : c.getParsedTransaction(s.signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' }),
+  const next: Record<string, string> = { ...cmap };
+  const seen = new Map<string, number>(); // signature -> blockTime, dedupes txs touching several sources
+  for (const s of sources) {
+    const until = cmap[s.key];
+    // A source we've never tracked before (a token account added by this upgrade, or a newly-added mint)
+    // is baselined silently — record its latest signature and emit nothing, so we don't replay old history.
+    if (until === undefined) {
+      const [latest] = await c.getSignaturesForAddress(s.pk, { limit: 1 }).catch(() => []);
+      next[s.key] = latest?.signature ?? 'none';
+      continue;
+    }
+    let sigs;
+    try {
+      sigs = await c.getSignaturesForAddress(s.pk, until !== 'none' ? { until, limit: 25 } : { limit: 25 });
+    } catch {
+      continue;
+    }
+    if (sigs.length) next[s.key] = sigs[0].signature;
+    for (const si of sigs) if (!si.err) seen.set(si.signature, si.blockTime ?? 0);
+  }
+
+  if (seen.size === 0) return { events: [], cursor: JSON.stringify(next) };
+
+  const ordered = [...seen.entries()].sort((a, b) => a[1] - b[1]).map((e) => e[0]); // oldest first
+  const txs = await mapLimit(ordered, 5, (sig) =>
+    c.getParsedTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' }).catch(() => null),
   );
-
-  // A just-landed tx can be listed before its details are ready. Stop at that point and pick it up
-  // next run, rather than advancing the cursor past it and missing it permanently.
   const events: TxEvent[] = [];
-  let newCursor = cursor;
-  for (let i = 0; i < ordered.length; i++) {
-    const s = ordered[i];
+  ordered.forEach((sig, i) => {
     const tx = txs[i];
-    if (!s.err && !tx) break;
-    if (tx?.meta) events.push(...parseSolTx(net, address, s.signature, tx));
-    newCursor = s.signature;
-  }
-  return { events, cursor: newCursor };
+    if (tx?.meta) events.push(...parseSolTx(net, address, sig, tx));
+  });
+  return { events, cursor: JSON.stringify(next) };
 }
 
 function parseSolTx(net: Network, address: string, sig: string, tx: ParsedTransactionWithMeta): TxEvent[] {
