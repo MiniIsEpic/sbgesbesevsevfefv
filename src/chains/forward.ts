@@ -10,6 +10,7 @@ import type { Network } from '../networks.js';
 import { btcBalance, btcSend, BTC_FEE_RESERVE } from './btc.js';
 import { evmSend, provider } from './evm.js';
 import { solConn, solSend, SOL_FEE, SOL_RENT_MIN } from './sol.js';
+import { tokenBalance } from './token.js';
 import type { Sent, TxEvent } from './types.js';
 
 /**
@@ -52,9 +53,14 @@ async function forwardToken(net: Network, phrase: string, index: number, e: TxEv
 
   if (net.kind === 'evm') {
     const w = evmWallet(phrase, index).connect(provider(net));
+    // Send the current balance, not the historical received amount, so it can't fail on "insufficient
+    // funds" when the balance differs slightly, and it sweeps any token already sitting in the account.
+    const bal = await tokenBalance(net, w.address, e.token);
+    const amount = bal < e.delta ? bal : e.delta;
+    if (amount <= 0n) throw new Error('No token balance available to forward (already moved?)');
     const erc20 = new Contract(e.token, ['function transfer(address to, uint256 amount) returns (bool)'], w);
-    const tx = await erc20.transfer(getAddress(to), e.delta);
-    return { txid: tx.hash as string, amount: e.delta };
+    const tx = await erc20.transfer(getAddress(to), amount);
+    return { txid: tx.hash as string, amount };
   }
 
   if (net.kind === 'sol') {
@@ -64,15 +70,19 @@ async function forwardToken(net: Network, phrase: string, index: number, e: TxEv
     const dest = new PublicKey(to);
     const fromAta = getAssociatedTokenAddressSync(mint, kp.publicKey);
     const toAta = getAssociatedTokenAddressSync(mint, dest, true);
+    // Use the live balance of this account's token account, capped at the received amount.
+    const bal = await tokenBalance(net, kp.publicKey.toBase58(), e.token);
+    const amount = bal < e.delta ? bal : e.delta;
+    if (amount <= 0n) throw new Error('No USDC/USDT balance available to forward (already moved?)');
     const { blockhash, lastValidBlockHeight } = await c.getLatestBlockhash();
     const tx = new Transaction({ feePayer: kp.publicKey, blockhash, lastValidBlockHeight }).add(
       // Creates the destination token account if missing (~0.002 SOL rent, paid by this account).
       createAssociatedTokenAccountIdempotentInstruction(kp.publicKey, toAta, dest, mint),
-      createTransferCheckedInstruction(fromAta, mint, toAta, kp.publicKey, e.delta, e.decimals),
+      createTransferCheckedInstruction(fromAta, mint, toAta, kp.publicKey, amount, e.decimals),
     );
     tx.sign(kp);
     const txid = await c.sendRawTransaction(tx.serialize(), { maxRetries: 5 });
-    return { txid, amount: e.delta };
+    return { txid, amount };
   }
 
   throw new Error(`Token forwarding isn't supported on ${net.name}`);
